@@ -20,12 +20,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
-	cloudproviderapi "k8s.io/cloud-provider/api"
 
 	"github.com/openshift/windows-machine-config-operator/controllers"
-	"github.com/openshift/windows-machine-config-operator/pkg/crypto"
 	"github.com/openshift/windows-machine-config-operator/pkg/metadata"
-	"github.com/openshift/windows-machine-config-operator/pkg/nodeconfig"
 	"github.com/openshift/windows-machine-config-operator/pkg/patch"
 	"github.com/openshift/windows-machine-config-operator/pkg/retry"
 	"github.com/openshift/windows-machine-config-operator/pkg/wiparser"
@@ -45,12 +42,14 @@ const (
 func creationTestSuite(t *testing.T) {
 	tc, err := NewTestContext()
 	require.NoError(t, err)
-	// The order of tests here are important. Any node object related tests should be run only after
-	// testWindowsNodeCreation as that initializes the node objects in the global context.
+
+	require.NoError(t, tc.loadExistingNodes(), "error getting the current Windows nodes in the cluster")
 	if !t.Run("Creation", tc.testWindowsNodeCreation) {
 		// No point in running the other tests if creation failed
 		return
 	}
+	t.Run("Nodes ready and schedulable", tc.testNodesBecomeReadyAndSchedulable)
+	t.Run("Node annotations", tc.testNodeAnnotations)
 	t.Run("Node Metadata", tc.testNodeMetadata)
 	t.Run("Services ConfigMap validation", tc.testServicesConfigMap)
 	t.Run("Services running", tc.testExpectedServicesRunning)
@@ -64,8 +63,26 @@ func creationTestSuite(t *testing.T) {
 	t.Run("Kubelet priority class validation", tc.testKubeletPriorityClass)
 }
 
+// loadExistingNodes adds all configured Windows Nodes to the globalContext cache
+func (tc *testContext) loadExistingNodes() error {
+	byohNodes, err := tc.listFullyConfiguredWindowsNodes(true)
+	if err != nil {
+		return err
+	}
+	machineNodes, err := tc.listFullyConfiguredWindowsNodes(false)
+	if err != nil {
+		return err
+	}
+	gc.byohNodes = byohNodes
+	gc.machineNodes = machineNodes
+	return nil
+}
+
 // testWindowsNodeCreation tests the Windows node creation in the cluster
 func (tc *testContext) testWindowsNodeCreation(t *testing.T) {
+	if len(gc.machineNodes) == numberOfMachineNodes && len(gc.byohNodes) == numberOfBYOHNodes {
+		t.Skip("expected nodes already exist in the cluster")
+	}
 	// Create a private key secret with the known private key.
 	require.NoError(t, tc.createPrivateKeySecret(true), "could not create known private key secret")
 
@@ -143,23 +160,61 @@ func (tc *testContext) testMachineConfiguration(t *testing.T) {
 	}
 	_, err := tc.createWindowsMachineSet(gc.numberOfMachineNodes, false)
 	require.NoError(t, err, "failed to create Windows MachineSet")
-	// We need to cover the case where a user changes the private key secret before the WMCO has a chance to
-	// configure the Machine. In order to simulate that case we need to wait for the MachineSet to be fully
-	// provisioned and then change the key. The correct amount of nodes being configured is proof that the
-	// mismatched Machine created with the mismatched key was deleted and replaced.
-	// Depending on timing and configuration flakes this will either cause all Machines, or all Machines after
-	// the first configured Machines to hit this scenario. This is a platform agonistic test so we run it only on
-	// Azure.
+
+	t.Run("Machine configuration while private key change", tc.testMachineConfigurationWhilePrivateKeyChange)
+
 	machines, err := tc.waitForWindowsMachines(int(gc.numberOfMachineNodes), "Provisioned", false)
 	require.NoError(t, err, "error waiting for Windows Machines to be provisioned")
-	if tc.CloudProvider.GetType() == config.AzurePlatformType {
-		// Replace the known private key with a randomly generated one.
-		err = tc.createPrivateKeySecret(false)
-		require.NoError(t, err, "error replacing private key secret")
-	}
-	err = tc.waitForWindowsNodes(gc.numberOfMachineNodes, false, false, false)
+	err = tc.waitForConfiguredWindowsNodes(gc.numberOfMachineNodes, false, false)
 	assert.NoError(t, err, "Windows node creation failed")
 	tc.machineLogCollection(machines.Items)
+}
+
+// testMachineConfigurationWhilePrivateKeyChange tests that machines which have not yet been configured by WMCO are
+// deleted after the private key is changed, but before WMCO is able to configure them, resulting in WMCO getting an
+// SSH authentication error. This could be considered a platform-agnostic test (except for vSphere where the private
+// key is baked in the VM template) so we run it only on Azure.
+func (tc *testContext) testMachineConfigurationWhilePrivateKeyChange(t *testing.T) {
+	if tc.CloudProvider.GetType() != config.AzurePlatformType {
+		t.Skip("test disabled, exclusively runs on Azure")
+	}
+	machines, err := tc.waitForWindowsMachines(int(gc.numberOfMachineNodes), "Provisioned", false)
+	require.NoError(t, err, "error waiting for Windows Machines to be provisioned")
+
+	err = tc.createPrivateKeySecret(false)
+	require.NoError(t, err, "error replacing private key secret")
+
+	err = tc.waitForMachinesDeleted(machines.Items)
+	require.NoError(t, err, "error waiting for machines deletion after private key secret change")
+}
+
+// waitForMachinesDeleted waits for the given list of machines to be deleted
+func (tc *testContext) waitForMachinesDeleted(machines []mapi.Machine) (err error) {
+	// This is the maximum amount of time for the deletion of all machines in Azure
+	deletionTimeout := time.Minute * 15
+	for _, m := range machines {
+		log.Printf("waiting (timeout: %s) for machine %s to be deleted", deletionTimeout.String(), m.GetName())
+		err = wait.Poll(retry.ResourceChangeTimeout, deletionTimeout, func() (done bool, err error) {
+			_, err = tc.client.Machine.Machines(clusterinfo.MachineAPINamespace).Get(context.TODO(), m.GetName(),
+				metav1.GetOptions{})
+			if err != nil {
+				if apierrors.IsNotFound(err) {
+					// machine deleted
+					return true, nil
+				}
+				log.Printf("error getting machine object, retrying: %v", err)
+				return false, nil
+			}
+			// machine exist, wait for it to be deleted
+			log.Printf("waiting for machine %s to be deleted", m.GetName())
+			return false, nil
+		})
+		// fail on any machine timeout
+		if err != nil {
+			break
+		}
+	}
+	return err
 }
 
 // machineLogCollection makes a best effort attempt to collect logs from each Machine instance
@@ -199,7 +254,7 @@ func (tc *testContext) testBYOHConfiguration(t *testing.T) {
 	}
 	// Wait for Windows worker node to become available
 	t.Run("VM is configured by ConfigMap controller", func(t *testing.T) {
-		err := tc.waitForWindowsNodes(gc.numberOfBYOHNodes, false, false, true)
+		err := tc.waitForConfiguredWindowsNodes(gc.numberOfBYOHNodes, false, true)
 		assert.NoError(t, err, "Windows node creation failed")
 	})
 	// Make a best effort attempt to collect logs from each BYOH instance
@@ -430,39 +485,15 @@ func (tc *testContext) waitForWindowsMachines(machineCount int, phase string, ig
 	return machines, err
 }
 
-// waitForWindowsNode waits until there exists nodeCount Windows nodes with the correct set of annotations.
-// if expectError = true, the function will wait for duration of 10 minutes if we are deleting all nodes i.e. 0 nodesCount
-// else 5 minutes for the nodes as the error would be thrown immediately, else we will wait for the duration given by
-// nodeCreationTime variable which is 20 minutes increasing the overall wait time in test suite
-func (tc *testContext) waitForWindowsNodes(nodeCount int32, expectError, checkVersion bool, isBYOH bool) error {
-	annotations := []string{nodeconfig.HybridOverlaySubnet, nodeconfig.HybridOverlayMac, metadata.VersionAnnotation,
-		nodeconfig.PubKeyHashAnnotation, controllers.UsernameAnnotation}
-
-	var creationTime time.Duration
+// waitForConfiguredWindowsNodes waits until there exists nodeCount Windows nodes that have reported they have been
+// configured by WICD. Specifically the signal for this is the version annotation is applied to the node by WICD, with
+// a value matching the desired version annotation.
+func (tc *testContext) waitForConfiguredWindowsNodes(nodeCount int32, checkVersion, isBYOH bool) error {
 	startTime := time.Now()
-	if expectError {
-		if nodeCount == 0 {
-			creationTime = time.Minute * 10
-		} else {
-			// The time we expect to wait, if the ignore label is
-			// not used while creating nodes.
-			creationTime = time.Minute * 5
-		}
-	} else {
-		creationTime = nodeCreationTime
-	}
-
-	privKey, pubKey, err := tc.getExpectedKeyPair()
-	if err != nil {
-		return fmt.Errorf("error getting the expected public/private key pair: %w", err)
-	}
-	pubKeyAnnotation := nodeconfig.CreatePubKeyHashAnnotation(pubKey)
 
 	// We are waiting 20 minutes for each windows VM to be shown up in the cluster. The value comes from
-	// nodeCreationTime variable.  If we are testing a scale down from n nodes to 0, then we should
-	// not take the number of nodes into account. If we are testing node creation without applying the ignore label, we
-	// should throw error within 5 mins.
-	err = wait.Poll(nodeRetryInterval, time.Duration(math.Max(float64(nodeCount), 1))*creationTime, func() (done bool, err error) {
+	// nodeCreationTime variable.
+	err := wait.Poll(nodeRetryInterval, time.Duration(math.Max(float64(nodeCount), 1))*nodeCreationTime, func() (done bool, err error) {
 		nodes, err := tc.listFullyConfiguredWindowsNodes(isBYOH)
 		if err != nil {
 			log.Printf("failed to get list of configured Windows nodes: %s", err)
@@ -470,40 +501,6 @@ func (tc *testContext) waitForWindowsNodes(nodeCount int32, expectError, checkVe
 		}
 
 		for _, node := range nodes {
-			// check node status
-			readyCondition := false
-			for _, condition := range node.Status.Conditions {
-				if condition.Type == v1.NodeReady {
-					readyCondition = true
-				}
-				if readyCondition && condition.Status != v1.ConditionTrue {
-					log.Printf("node %v is expected to be in Ready state", node.Name)
-					return false, nil
-				}
-			}
-			if !readyCondition {
-				log.Printf("expected node Status to have condition type Ready for node %v", node.Name)
-				return false, nil
-			}
-			// explicitly check for the external cloud provider taint for more helpful test logging
-			for _, taint := range node.Spec.Taints {
-				if taint.Key == cloudproviderapi.TaintExternalCloudProvider && taint.Effect == v1.TaintEffectNoSchedule {
-					log.Printf("expected node %s to not have the external cloud provider taint", node.GetName())
-					return false, nil
-				}
-			}
-			if node.Spec.Unschedulable {
-				log.Printf("expected node %s to be schedulable", node.Name)
-				return false, nil
-			}
-
-			for _, annotation := range annotations {
-				_, found := node.Annotations[annotation]
-				if !found {
-					log.Printf("node %s does not have annotation: %s", node.GetName(), annotation)
-					return false, nil
-				}
-			}
 			if checkVersion {
 				operatorVersion, err := getWMCOVersion()
 				if err != nil {
@@ -513,24 +510,6 @@ func (tc *testContext) waitForWindowsNodes(nodeCount int32, expectError, checkVe
 				if node.Annotations[metadata.VersionAnnotation] != operatorVersion {
 					log.Printf("node %s has mismatched version annotation %s. expected: %s", node.GetName(),
 						node.Annotations[metadata.VersionAnnotation], operatorVersion)
-					return false, nil
-				}
-			}
-			if node.Annotations[nodeconfig.PubKeyHashAnnotation] != pubKeyAnnotation {
-				log.Printf("node %s has mismatched pubkey annotation value %s expected: %s", node.GetName(),
-					node.Annotations[nodeconfig.PubKeyHashAnnotation], pubKeyAnnotation)
-				return false, nil
-			}
-			// Ensure username annotation is decipherable and correct. Skip if deconfiguring node
-			if !expectError {
-				username, err := crypto.DecryptFromJSONString(node.Annotations[controllers.UsernameAnnotation], privKey)
-				if err != nil {
-					log.Printf("error decrypting username annotation for node %s: %s", node.Name, err)
-					return false, nil
-				}
-				if username != tc.vmUsername() {
-					log.Printf("username %s does not match expected value %s for node %s:", username, tc.vmUsername(),
-						node.Name)
 					return false, nil
 				}
 			}

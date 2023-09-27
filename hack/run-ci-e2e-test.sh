@@ -58,8 +58,8 @@ while getopts ":m:c:b:st:w:" opt; do
       ;;
     t ) # test to run. Defaults to all. Other options are basic and upgrade.
       TEST=$OPTARG
-      if [[ "$TEST" != "all" && "$TEST" != "basic" && "$TEST" != "upgrade" ]]; then
-        echo "Invalid -t option $TEST. Valid options are all, basic or upgrade"
+      if [[ "$TEST" != "all" && "$TEST" != "basic" && "$TEST" != "upgrade" && "$TEST" != "upgrade-setup" && "$TEST" != "upgrade-test" ]]; then
+        echo "Invalid -t option $TEST. Valid options are all, basic, upgrade, upgrade-setup, and upgrade-test"
         exit 1
       fi
       ;;
@@ -86,6 +86,7 @@ fi
 SKIP_NODE_DELETION=${SKIP_NODE_DELETION:-"false"}
 
 # Setup and run the operator if it is not already deployed
+wmco_deployed_by_script=false
 if  ! oc get deploy/windows-machine-config-operator -n $WMCO_DEPLOY_NAMESPACE > /dev/null; then
   # OPERATOR_IMAGE defines where the WMCO image to test with is located. If $OPERATOR_IMAGE is already set, use its value.
   # Setting $OPERATOR_IMAGE is required for local testing.
@@ -110,6 +111,7 @@ if  ! oc get deploy/windows-machine-config-operator -n $WMCO_DEPLOY_NAMESPACE > 
       sleep 5
       retries+=1
   done
+  wmco_deployed_by_script=true
 fi
 
 # WINDOWS_INSTANCES_DATA holds the windows-instances ConfigMap data section
@@ -140,12 +142,15 @@ GO_TEST_ARGS="$BYOH_NODE_COUNT_OPTION $MACHINE_NODE_COUNT_OPTION --private-key-p
 # Test that the operator is running when the private key secret is not present
 printf "\n####### Testing operator deployed without private key secret #######\n" >> "$ARTIFACT_DIR"/wmco.log
 go test ./test/e2e/... -run=TestWMCO/operator_deployed_without_private_key_secret -v -args $GO_TEST_ARGS
-# Run the creation tests of the Windows VMs
-printf "\n####### Testing creation #######\n" >> "$ARTIFACT_DIR"/wmco.log
-go test ./test/e2e/... -run=TestWMCO/create -v -timeout=90m -args $GO_TEST_ARGS
-# Get logs for the creation tests
-printf "\n####### WMCO logs for creation tests #######\n" >> "$ARTIFACT_DIR"/wmco.log
-get_WMCO_logs
+
+if [[ "$TEST" != "upgrade-setup" && "$TEST" != "upgrade-test" ]]; then
+  # Run the creation tests of the Windows VMs
+  printf "\n####### Testing creation #######\n" >> "$ARTIFACT_DIR"/wmco.log
+  go test ./test/e2e/... -run=TestWMCO/create -v -timeout=90m -args $GO_TEST_ARGS
+  # Get logs for the creation tests
+  printf "\n####### WMCO logs for creation tests #######\n" >> "$ARTIFACT_DIR"/wmco.log
+  get_WMCO_logs
+fi
 
 if [[ "$TEST" = "all" || "$TEST" = "basic" ]]; then
   printf "\n####### Testing network #######\n" >> "$ARTIFACT_DIR"/wmco.log
@@ -162,13 +167,19 @@ if [[ "$TEST" = "all" || "$TEST" = "upgrade" ]]; then
   go test ./test/e2e/... -run=TestWMCO/upgrade -v -timeout=90m -args $GO_TEST_ARGS
 
   # Run the reconfiguration test
-  # The reconfiguration suite must be run directly before the deletion suite. This is because we do not
-  # currently wait for nodes to fully reconcile after changing the private key back to the valid key. Any tests
-  # added/moved in between these two suites may fail.
-  # This limitation will be removed with https://issues.redhat.com/browse/WINC-655
   printf "\n####### Testing reconfiguration #######\n" >> "$ARTIFACT_DIR"/wmco.log
   go test ./test/e2e/... -run=TestWMCO/reconfigure -v -timeout=90m -args $GO_TEST_ARGS
 fi
+
+if [[ "$TEST" = "upgrade-setup" ]]; then
+  go test ./test/e2e/... -run=TestWMCO/create/Creation -v -timeout=90m -args $GO_TEST_ARGS
+  go test ./test/e2e/... -run=TestWMCO/create/Nodes_ready_and_schedulable -v -timeout=90m -args $GO_TEST_ARGS
+fi
+
+if [[ "$TEST" = "upgrade-test" ]]; then
+  go test ./test/e2e/... -run=TestUpgrade -v -timeout=20m -args $GO_TEST_ARGS
+fi
+
 
 # Run the deletion tests while testing operator restart functionality. This will clean up VMs created
 # in the previous step
@@ -182,7 +193,7 @@ if ! $SKIP_NODE_DELETION; then
   printf "\n####### WMCO logs for %s deletion tests #######\n" "$PRINT_UPGRADE" >> "$ARTIFACT_DIR"/wmco.log
   get_WMCO_logs
   # Cleanup the operator resources
-  if ! [[ "$OPENSHIFT_CI" = "true" &&  "$TEST" = "upgrade" ]]; then
+  if [ "$wmco_deployed_by_script" = "true" ]; then
     cleanup_WMCO $OSDK
   fi
 else

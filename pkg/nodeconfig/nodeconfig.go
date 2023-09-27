@@ -309,13 +309,17 @@ func (nc *nodeConfig) createFilesFromIgnition() (map[string]string, error) {
 		return nil, err
 	}
 
-	filesToTransfer := map[string]struct{}{
-		ignition.KubeletCACertPath: {},
-	}
+	filesToTransfer := map[string]struct{}{}
 	if _, ok := kubeletArgs[ignition.CloudConfigOption]; ok {
 		filesToTransfer[ignition.CloudConfigPath] = struct{}{}
 	}
 	filePathsToContents := make(map[string]string)
+	// process kubelet-ca
+	filePathsToContents[windows.K8sDir+"\\"+KubeletClientCAFilename] = string(ign.GetKubeletCAData())
+	// loop through all the files in the ignition if they are files to transfer
+	if len(filesToTransfer) == 0 {
+		return filePathsToContents, nil
+	}
 	// For each new file in the ignition file check if is a file we are interested in and, if so, decode its contents
 	for _, ignFile := range ign.GetFiles() {
 		if _, ok := filesToTransfer[ignFile.Node.Path]; ok {
@@ -424,7 +428,7 @@ func (nc *nodeConfig) setNode(quickCheck bool) error {
 	}
 
 	instanceAddress := nc.GetIPv4Address()
-	err := wait.Poll(retryInterval, retryTimeout, func() (bool, error) {
+	err := wait.PollImmediate(retryInterval, retryTimeout, func() (bool, error) {
 		nodes, err := nc.k8sclientset.CoreV1().Nodes().List(context.TODO(),
 			meta.ListOptions{LabelSelector: WindowsOSLabel})
 		if err != nil {
@@ -484,6 +488,14 @@ func (nc *nodeConfig) Deconfigure() error {
 	}
 	if err := nc.Windows.Deconfigure(nc.wmcoNamespace, wicdKC); err != nil {
 		return fmt.Errorf("error deconfiguring instance: %w", err)
+	}
+
+	// Windows Server 2022 VMs on AWS have a non-persistent route to the metadata endpoint. This is lost when the HNS
+	// networks are deleted. Explicitly restore them to allow the same VM to be configured as a node again.
+	if nc.platformType == configv1.AWSPlatformType {
+		if err := nc.Windows.RestoreAWSRoutes(); err != nil {
+			return err
+		}
 	}
 
 	nc.log.Info("instance has been deconfigured", "node", nc.node.GetName())
