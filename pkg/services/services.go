@@ -306,7 +306,7 @@ func getHostnameCmd(platformType config.PlatformType) string {
 	case config.GCPPlatformType:
 		return windows.GcpGetHostnameScriptRemotePath
 	case config.BareMetalPlatformType:
-		return "[System.Net.Dns]::Resolve((Find-NetRoute -RemoteIPAddress \"0.0.0.0\").IPAddress[0]).HostName"
+		return "(Resolve-DnsName (Find-NetRoute -RemoteIPAddress \"0.0.0.0\").IPAddress[0] -DnsOnly -Type PTR)[0].NameHost"
 	default:
 		// by default use the original hostname
 		return ""
