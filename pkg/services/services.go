@@ -311,7 +311,7 @@ func getHostnameCmd(platformType config.PlatformType) string {
 	case config.VSpherePlatformType:
 		return windows.GetHostnameFQDNCommand
 	case config.BareMetalPlatformType:
-		return "[System.Net.Dns]::Resolve((Find-NetRoute -RemoteIPAddress \"0.0.0.0\").IPAddress[0]).HostName"
+		return "(Resolve-DnsName (Find-NetRoute -RemoteIPAddress \"0.0.0.0\").IPAddress[0] -DnsOnly -Type PTR)[0].NameHost"
 	default:
 		// by default do not override the hostname, the cloud provider determines the name of the node
 		return ""
