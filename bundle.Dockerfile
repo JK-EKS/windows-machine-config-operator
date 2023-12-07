@@ -1,3 +1,11 @@
+FROM alpine:latest AS BASE
+
+ARG IMG=REPLACE_IMAGE
+
+WORKDIR /bundle
+COPY bundle/ .
+RUN find . -type f -regex ".*\.\(yaml\|yml\)" -exec sed -i s?REPLACE_IMAGE?${IMG}?g {} +
+
 FROM scratch
 
 # This block are standard Red Hat container labels
@@ -41,5 +49,5 @@ LABEL operators.operatorframework.io.metrics.mediatype.v1=metrics+v1
 LABEL operators.operatorframework.io.metrics.project_layout=go.kubebuilder.io/v3
 
 # Copy files to locations specified by labels.
-COPY bundle/manifests /manifests/
-COPY bundle/metadata /metadata/
+COPY --from=BASE /bundle/manifests /manifests/
+COPY --from=BASE /bundle/metadata /metadata/
