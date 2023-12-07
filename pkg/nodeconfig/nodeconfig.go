@@ -781,3 +781,7 @@ func validWICDServiceAccountTokenSecret(secret core.Secret) bool {
 	}
 	return true
 }
+
+func GetNodeConfig() cache {
+	return nodeConfigCache
+}
