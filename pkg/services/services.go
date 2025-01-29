@@ -235,7 +235,8 @@ func getKubeletServiceConfiguration(argsFromIginition map[string]string, debug b
 		preScripts = append(preScripts, nodeIPOverridePowershellVar)
 	}
 
-	kubeletServiceCmd := windows.KubeletPath
+	kubeletServiceCmd := fmt.Sprintf("%s -log-file=%s %s",
+		windows.KubeLogRunnerPath, windows.KubeletLog, windows.KubeletPath)
 	for _, arg := range kubeletArgs {
 		kubeletServiceCmd += fmt.Sprintf(" %s", arg)
 	}
